@@ -9,7 +9,6 @@ use tickloop::TickLoop;
 mod clients;
 //mod crypt;
 mod codec;
-mod define;
 mod filter;
 mod game;
 mod handle_packets;

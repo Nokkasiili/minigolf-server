@@ -416,8 +416,9 @@ impl GameServer {
                     })
                 }
             }
-            if 0 == room.playing_players() {
+            if 0 == room.playing_players() || 0 == room.players().len(){
                 rooms_to_remove.insert(id);
+                continue; //dont fuck with removed rooms anymore
             }
             if room.all_end_strokes() {
                 //TODO handle scoring

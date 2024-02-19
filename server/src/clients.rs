@@ -137,7 +137,13 @@ impl Client {
     pub fn status_string(&self) -> String {
         //w worm r registered v vip s sherif n no challenges
         let mut s = String::new();
-        s.push('r');
+
+        if let Some('~') = self.name().chars().next() {
+            s.push('w');
+        }else{
+            s.push('r');
+        }
+
         if self.no_challenges() {
             s.push('n');
         }

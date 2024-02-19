@@ -1,12 +1,11 @@
-use std::ops::Add;
-
-use anyhow::bail;
 use flume::{Receiver, Sender};
 use protocol::{
     client::{ClientToServer, Language, LoginType, TLog, TTLogin, Version},
-    common::{DLoginStatus, NoneAsTab, Packet, PacketNumber, SomeAsTab},
-    server::{self, BasicInfo, Error, ServerToClient, StatusLobbySelect, StatusLogin, VersOk},
+    common::{PacketNumber, SomeAsTab},
+    server::{BasicInfo, Error, ServerToClient, StatusLobbySelect, StatusLogin, VersOk},
 };
+use rand::Rng;
+
 
 use crate::listener::Worker;
 
@@ -29,6 +28,11 @@ pub struct NewPlayer {
 pub fn add_num(i: &mut u32) -> u32 {
     *i = *i + 1;
     *i
+}
+
+fn generate_username() -> String {
+    let random_number: u32 = rand::thread_rng().gen_range(0..10000);
+    format!("~anonym-{}", random_number)
 }
 
 pub async fn handle(worker: &mut Worker) -> anyhow::Result<InitialHandling> {
@@ -90,7 +94,7 @@ pub async fn handle(worker: &mut Worker) -> anyhow::Result<InitialHandling> {
     */
     let username = match login.username.0 {
         Some(username) => username,
-        None => "igogiko on homo".to_string(),
+        None => generate_username(),//TODO
     };
 
     worker
