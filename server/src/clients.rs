@@ -140,14 +140,13 @@ impl Client {
 
         if let Some('~') = self.name().chars().next() {
             s.push('w');
-        }else{
+        } else {
             s.push('r');
         }
 
         if self.no_challenges() {
             s.push('n');
         }
-        s
     }
 }
 
