@@ -1,24 +1,18 @@
-use std::{
-    borrow::{Borrow, BorrowMut},
-    cell::RefCell,
-    process::id,
-    sync::Arc,
-};
+use std::{ops::Add, time::Instant};
 
 use protocol::{
-    client::{ClientToServer, LobbyChallenge},
+    client::ClientToServer,
     common::{DLobbyType, JoinLeaveReason, NonEmptyOption, SomeAsTab, User},
     server::{
         Game, GameBeginStroke, GameGameInfo, GameJoin, GameOwnInfo, GamePart, GamePlayers, GameSay,
-        GameStartTurn, LobbyCFail, LobbyCancel, LobbyGamelistFull, LobbyJoin, LobbyJoinFromGame,
+        GameVoteSkip, LobbyCFail, LobbyCancel, LobbyGamelistFull, LobbyJoin, LobbyJoinFromGame,
         LobbyNC, LobbyOwnJoin, LobbyPart, LobbySay, LobbySayP, LobbySelectNop, LobbySheriffSay,
         LobbyUsers, Player, ServerToClient, StatusGame, StatusLobby, StatusLobbySelect,
     },
 };
-use tokio::time::error;
 
 use crate::{
-    clients::{Client, ClientId},
+    clients::Client,
     game::{GameId, GameServer, GameStatus, MinigolfGame},
     server::Server,
 };
@@ -297,12 +291,16 @@ pub fn handle_packets_game(
         ClientToServer::GameBeginStroke(stroke) => {
             if let Some(game_id) = client.game() {
                 if let Some(game) = games.get(game_id) {
+                    game.set_turn_start(Instant::now());
                     if let Some(index) = game.get_index(client.id().unwrap()) {
                         if index != game.turn() {
                             log::debug!("{} tried to shoot in a wrong turn", client.name());
                             return;
                         }
-                        server.broadcast_game_with(client.game(), |c| {
+                        let strokes = game.players()[index].as_ref().unwrap().cur_strokes;
+
+                        game.players_mut()[index].as_mut().unwrap().cur_strokes = strokes + 1;
+                        server.broadcast_game_with(&game, |c| {
                             if c.id() != client.id() {
                                 c.send_packet(ServerToClient::GameBeginStroke(GameBeginStroke {
                                     packet_number: c.next_num(),
@@ -321,8 +319,9 @@ pub fn handle_packets_game(
             if let Some(game_id) = client.game() {
                 if let Some(game) = games.get(game_id) {
                     if endstroke.index != game.turn() {
-                        log::error!("{} ends wrong stroke", client.name());
-                        return;
+                        log::debug!("{} ends wrong stroke", client.name());
+                        //this stuff is expected :D
+                        //return;
                     }
 
                     if game.max_players() != endstroke.in_hole.len() {
@@ -330,19 +329,32 @@ pub fn handle_packets_game(
                         return;
                     }
                     if let Some(index) = game.get_index(client.id().unwrap()) {
-                        game.players()[index].has_sent_end_stroke.set(true);
+                        game.players_mut()[index]
+                            .as_mut()
+                            .unwrap()
+                            .has_sent_end_stroke = true;
                     }
 
                     for (i, c) in endstroke.in_hole.chars().enumerate() {
-                        if let Some(player) = game.players().get(i) {
-                            if player.in_hole.get() == true && c == 'f' {
-                                log::error!(
+                        if let Some(player) = game.players_mut().get_mut(i) {
+                            if let Some(player) = player {
+                                if player.in_hole && c == 'f' {
+                                    log::error!(
                                     "{} tried to set in_hole back to false (clients are not sync)",
                                     client.name()
                                 )
-                            }
-                            if c == 't' {
-                                player.in_hole.set(true);
+                                }
+
+                                if c == 't' {
+                                    if !player.in_hole {
+                                        /*server.broadcast_game_with(Some(game_id), |other_client| {
+                                            ServerToClient::GameResetVoteSkip(GameResetVoteSkip {
+                                                packet_number: other_client.next_num(),
+                                            });
+                                        })*/
+                                    }
+                                    player.in_hole = true;
+                                }
                             }
                         }
                     }
@@ -367,11 +379,15 @@ pub fn handle_packets_game(
                         return;
                     }
                     if let Some(index) = game.get_index(client.id().unwrap()) {
-                        game.players()[index].want_skip.set(true);
-                    }
-
-                    if game.want_skip() {
-                        game.next_track(server);
+                        game.players_mut()[index].as_mut().unwrap().want_skip = true;
+                        server.broadcast_game_with(game, |c| {
+                            if c.id() != client.id() {
+                                c.send_packet(ServerToClient::GameVoteSkip(GameVoteSkip {
+                                    packet_number: c.next_num(),
+                                    index,
+                                }))
+                            }
+                        })
                     }
                 }
             }
@@ -382,16 +398,18 @@ pub fn handle_packets_game(
                     let _ = game.add_player(client.id().unwrap());
                     let index = game.get_index(client.id().unwrap()).unwrap();
                     for game_player in game.players().iter() {
-                        if Some(game_player.id) == client.id() {
-                            continue;
+                        if let Some(game_player) = game_player {
+                            if Some(game_player.id) == client.id() {
+                                continue;
+                            }
+                            let client = server.clients.get(game_player.id).unwrap();
+                            client.send_packet(ServerToClient::GameJoin(GameJoin {
+                                packet_number: client.next_num(),
+                                index,
+                                name: client.name().to_string(),
+                                clan: NonEmptyOption(client.clan().cloned()),
+                            }));
                         }
-                        let client = server.clients.get(game_player.id).unwrap();
-                        client.send_packet(ServerToClient::GameJoin(GameJoin {
-                            packet_number: client.next_num(),
-                            index,
-                            name: client.name().to_string(),
-                            clan: NonEmptyOption(client.clan().cloned()),
-                        }));
                     }
                     client.set_game(Some(game_id));
                 }
@@ -403,24 +421,26 @@ pub fn handle_packets_game(
                 let index = game.get_index(client.id().unwrap()).unwrap();
 
                 for game_player in game.players().iter() {
-                    //TODO own func
-                    if let Some(client) = server.clients.get(game_player.id) {
-                        let reason = match game.status() {
-                            GameStatus::WaitingPlayers => 6,
-                            _ => 4,
-                        };
-                        client.send_packet(ServerToClient::GamePart(GamePart {
-                            packet_number: client.next_num(),
-                            index,
-                            reason: reason,
-                        }))
+                    if let Some(game_player) = game_player {
+                        //TODO own func
+                        if let Some(client) = server.clients.get(game_player.id) {
+                            let reason = match game.status() {
+                                GameStatus::WaitingPlayers => 6,
+                                _ => 4,
+                            };
+                            client.send_packet(ServerToClient::GamePart(GamePart {
+                                packet_number: client.next_num(),
+                                index,
+                                reason: reason,
+                            }))
+                        }
                     }
                 }
                 if game.status() == GameStatus::WaitingPlayers {
                     game.remove_player(index);
                     game_changed(server, &games, client.game().unwrap());
                 } else {
-                    game.players().get(index).unwrap().in_game.set(false);
+                    *game.players_mut().get_mut(index).unwrap() = None;
                 }
                 client.set_game(None);
 
@@ -437,16 +457,18 @@ pub fn handle_packets_game(
             if let Some(game) = games.get(client.game().unwrap()) {
                 let index = game.get_index(client.id().unwrap()).unwrap();
                 for game_player in game.players().iter() {
-                    if game_player.id == client.id().unwrap() {
-                        continue;
-                    }
+                    if let Some(game_player) = game_player {
+                        if game_player.id == client.id().unwrap() {
+                            continue;
+                        }
 
-                    if let Some(client) = server.clients.get(game_player.id) {
-                        client.send_packet(ServerToClient::GameSay(GameSay {
-                            packet_number: client.next_num(),
-                            index,
-                            message: packet.message.clone(),
-                        }))
+                        if let Some(client) = server.clients.get(game_player.id) {
+                            client.send_packet(ServerToClient::GameSay(GameSay {
+                                packet_number: client.next_num(),
+                                index,
+                                message: packet.message.clone(),
+                            }))
+                        }
                     }
                 }
             }
@@ -550,24 +572,26 @@ pub fn game_join(server: &Server, client: &Client, game: &MinigolfGame) {
 
     let mut players = Vec::new();
     for game_player in game.players().iter() {
-        if Some(game_player.id) == client.id() {
-            continue;
-        }
-        if let Some(other_client) = server.clients.get(game_player.id) {
-            if let Some(player_index) = game.get_index(other_client.id().unwrap()) {
-                players.push(Player {
-                    index: player_index,
-                    name: other_client.name().to_string(),
-                    clan: NonEmptyOption(other_client.clan().cloned()),
-                });
+        if let Some(game_player) = game_player {
+            if Some(game_player.id) == client.id() {
+                continue;
+            }
+            if let Some(other_client) = server.clients.get(game_player.id) {
+                if let Some(player_index) = game.get_index(other_client.id().unwrap()) {
+                    players.push(Player {
+                        index: player_index,
+                        name: other_client.name().to_string(),
+                        clan: NonEmptyOption(other_client.clan().cloned()),
+                    });
 
-                if game.game_type() == DLobbyType::Multi {
-                    other_client.send_packet(ServerToClient::GameJoin(GameJoin {
-                        packet_number: other_client.next_num(),
-                        index,
-                        name: client.name().to_string(),
-                        clan: NonEmptyOption(client.clan().cloned()),
-                    }));
+                    if game.game_type() == DLobbyType::Multi {
+                        other_client.send_packet(ServerToClient::GameJoin(GameJoin {
+                            packet_number: other_client.next_num(),
+                            index,
+                            name: client.name().to_string(),
+                            clan: NonEmptyOption(client.clan().cloned()),
+                        }));
+                    }
                 }
             }
         }

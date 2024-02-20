@@ -147,6 +147,7 @@ impl Client {
         if self.no_challenges() {
             s.push('n');
         }
+        s
     }
 }
 

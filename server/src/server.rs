@@ -1,5 +1,5 @@
-use crate::game::GameStatus;
-use crate::game::{GameId, GameServer};
+use crate::game::GameServer;
+use crate::game::{GameStatus, MinigolfGame};
 use crate::handle_packets::game_changed;
 use crate::{
     clients::{Client, ClientId, Clients},
@@ -77,7 +77,7 @@ impl Server {
 
                             //Todo turn
                             game.remove_player(index);
-                            self.broadcast_game_with(Some(game_id), |client| {
+                            self.broadcast_game_with(&game, |client| {
                                 client.send_packet(ServerToClient::GamePart(GamePart {
                                     packet_number: client.next_num(),
                                     index,
@@ -86,14 +86,16 @@ impl Server {
                             });
                             game_changed(self, &games, game_id);
                         } else {
-                            self.broadcast_game_with(Some(game_id), |client| {
+                            self.broadcast_game_with(&game, |client| {
                                 client.send_packet(ServerToClient::GamePart(GamePart {
                                     packet_number: client.next_num(),
                                     index,
                                     reason: 4,
                                 }))
                             });
-                            game.players().get(index).unwrap().in_game.set(false);
+                            if let Some(player) = game.players_mut().get_mut(index) {
+                                *player = None;
+                            }
                         }
                     }
                 } else if let Some(lobby) = lobby {
@@ -139,9 +141,14 @@ impl Server {
             callback(client);
         }
     }
-    pub fn broadcast_game_with(&self, game_id: Option<GameId>, mut callback: impl FnMut(&Client)) {
-        for client in self.clients.iter().filter(|c| c.game() == game_id) {
-            callback(client);
+    pub fn broadcast_game_with(&self, game: &MinigolfGame, mut callback: impl FnMut(&Client)) {
+        for player in game.players().iter() {
+            if let Some(player) = player {
+                let client = self.clients.get(player.id);
+                if let Some(client) = client {
+                    callback(client);
+                }
+            }
         }
     }
 

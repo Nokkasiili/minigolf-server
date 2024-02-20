@@ -7,7 +7,7 @@ use protocol::{
     server::ServerToClient,
 };
 use std::ops::Add;
-use std::{fmt::Debug, io, sync::atomic::AtomicU32, time::Duration};
+use std::{fmt::Debug, io, time::Duration};
 use std::{io::ErrorKind, net::SocketAddr};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -78,7 +78,7 @@ impl Worker {
         Ok(())
     }
 
-    async fn proceed(mut self, result: InitialHandling) {
+    async fn proceed(self, result: InitialHandling) {
         match result {
             InitialHandling::Join(new_player) => {
                 let name = new_player.name.clone();

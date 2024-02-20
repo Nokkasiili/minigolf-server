@@ -4,20 +4,17 @@ use protocol::{
     common::{Collision, DLobbyType, NonEmptyOption, Scoring, TrackType, WaterEvent, WeightEnd},
     server::{
         Game, GameEnd, GameGameInfo, GameResetVoteSkip, GameStart, GameStartTrack, GameStartTurn,
-        LobbyGamelistRemove, LobbyPart, Player, ServerToClient,
+        LobbyGamelistRemove, ServerToClient,
     },
 };
 use slab::Slab;
-use std::time::{Duration, Instant};
 use std::{
-    any::Any,
     borrow::{Borrow, BorrowMut},
-    cell::{Cell, Ref, RefCell},
-    collections::{HashMap, HashSet},
-    f32::consts::E,
-    ops::Add,
+    cell::{Cell, RefCell, RefMut},
+    collections::HashSet,
     sync::atomic::AtomicUsize,
 };
+use std::{ops::Add, time::Instant};
 
 use crate::{
     clients::{Client, ClientId},
@@ -54,18 +51,19 @@ pub struct MinigolfGame {
     track_scoring_weighted_end: WeightEnd,
     status: Cell<GameStatus>,
     network_id: usize,
-    last_stroke: Instant,
-    players: RefCell<Vec<GamePlayer>>,
+    turn_start: Cell<Instant>,
+    players: RefCell<Vec<Option<GamePlayer>>>,
 }
 
 #[derive(Debug)]
 pub struct GamePlayer {
     pub id: ClientId,
-    pub in_hole: Cell<bool>,
-    pub in_game: Cell<bool>,
-    pub want_skip: Cell<bool>,
-    pub strokes: Cell<usize>,
-    pub has_sent_end_stroke: Cell<bool>,
+    pub strokes: Vec<i32>,
+    pub cur_strokes: usize,
+    pub in_hole: bool,
+    pub want_skip: bool,
+    pub rfng: bool,
+    pub has_sent_end_stroke: bool,
 }
 
 impl MinigolfGame {
@@ -73,13 +71,14 @@ impl MinigolfGame {
         if self.players.borrow().len() < self.max_players as usize {
             let p = GamePlayer {
                 id,
-                in_hole: Cell::new(false),
-                want_skip: Cell::new(false),
-                has_sent_end_stroke: Cell::new(false),
-                in_game: Cell::new(true),
-                strokes: Cell::new(0),
+                in_hole: false,
+                want_skip: false,
+                has_sent_end_stroke: false,
+                strokes: Vec::new(),
+                cur_strokes: 0,
+                rfng: false,
             };
-            self.players.borrow_mut().push(p);
+            self.players.borrow_mut().push(Some(p));
         } else {
             log::error!("Tried to add more players than expected");
             bail!("max players");
@@ -98,25 +97,42 @@ impl MinigolfGame {
 
     pub fn next_track(&self, server: &Server) {
         let cur_track = self.cur_track.get().add(1);
-        if cur_track > self.num_tracks {
-            for game_player in self.players().iter() {
-                if let Some(client) = server.clients.get(game_player.id) {
-                    client.send_packet(ServerToClient::GameEnd(GameEnd {
-                        packet_number: client.next_num(),
-                        winner: vec![1],
-                    }))
+        for game_player in self.players_mut().iter_mut() {
+            if let Some(player) = game_player {
+                player.in_hole = false;
+                player.want_skip = false;
+            }
+        }
+        if self.playing_players() == 1 && !self.is_solo() {
+            for (index, player) in self.players().iter().enumerate() {
+                if let Some(player) = player {
+                    if let Some(client) = server.clients.get(player.id) {
+                        client.send_packet(ServerToClient::GameEnd(GameEnd {
+                            packet_number: client.next_num(),
+                            winner: vec![index as i32], //TODO
+                        }));
+                        self.status.set(GameStatus::Ended);
+                        return;
+                    }
                 }
             }
-
+        }
+        if cur_track > self.num_tracks {
+            for game_player in self.players().iter() {
+                if let Some(game_player) = game_player {
+                    if let Some(client) = server.clients.get(game_player.id) {
+                        client.send_packet(ServerToClient::GameEnd(GameEnd {
+                            packet_number: client.next_num(),
+                            winner: vec![1], //TODO
+                        }));
+                        self.status.set(GameStatus::Ended);
+                    }
+                }
+            }
             return;
         }
-
-        //TODO HACK
-        for game_player in self.players().iter() {
-            game_player.in_hole.set(false);
-            game_player.want_skip.set(false);
-        }
         self.cur_track.set(cur_track);
+
         let turn = self.get_next_turn();
         if turn.is_none() {
             log::error!("failed to get next turn in next track\n");
@@ -124,17 +140,17 @@ impl MinigolfGame {
         }
 
         for game_player in self.players().iter() {
-            //    game_player.in_hole.set(false);
-            //     game_player.want_skip.set(false);
-            if let Some(client) = server.clients.get(game_player.id) {
-                client.send_packet(ServerToClient::GameResetVoteSkip(GameResetVoteSkip {
-                    packet_number: client.next_num(),
-                }));
-                client.send_packet(ServerToClient::GameStartTrack(track(client, self)));
-                client.send_packet(ServerToClient::GameStartTurn(GameStartTurn {
-                    packet_number: client.next_num(),
-                    index: turn.unwrap(),
-                }));
+            if let Some(game_player) = game_player {
+                if let Some(client) = server.clients.get(game_player.id) {
+                    client.send_packet(ServerToClient::GameResetVoteSkip(GameResetVoteSkip {
+                        packet_number: client.next_num(),
+                    }));
+                    client.send_packet(ServerToClient::GameStartTrack(track(client, self)));
+                    client.send_packet(ServerToClient::GameStartTurn(GameStartTurn {
+                        packet_number: client.next_num(),
+                        index: turn.unwrap(),
+                    }));
+                }
             }
         }
     }
@@ -148,35 +164,36 @@ impl MinigolfGame {
         self.cur_track.set(self.cur_track.get().add(1));
 
         for game_player in self.players().iter() {
-            if let Some(client) = server.clients.get(game_player.id) {
-                client.send_packet(ServerToClient::GameStart(GameStart {
-                    packet_number: client.next_num(),
-                }));
-                /*  client.send_packet(ServerToClient::GameResetVoteSkip(GameResetVoteSkip {
-                    packet_number: client.next_num(),
-                }));*/
+            if let Some(game_player) = game_player {
+                if let Some(client) = server.clients.get(game_player.id) {
+                    client.send_packet(ServerToClient::GameStart(GameStart {
+                        packet_number: client.next_num(),
+                    }));
+                    /*  client.send_packet(ServerToClient::GameResetVoteSkip(GameResetVoteSkip {
+                        packet_number: client.next_num(),
+                    }));*/
 
-                client.send_packet(ServerToClient::GameStartTrack(track(client, self)));
+                    client.send_packet(ServerToClient::GameStartTrack(track(client, self)));
 
-                client.send_packet(ServerToClient::GameStartTurn(GameStartTurn {
-                    packet_number: client.next_num(),
-                    index: self.turn.get(),
-                }))
+                    client.send_packet(ServerToClient::GameStartTurn(GameStartTurn {
+                        packet_number: client.next_num(),
+                        index: self.turn.get(),
+                    }))
+                }
             }
         }
     }
 
     pub fn get_next_turn(&self) -> Option<usize> {
-        for _ in 0..self.players().len() {
-            log::debug!("turn:{}", self.turn.get());
-            self.turn.set(self.turn.get().add(1) % self.players().len());
+        let num_players = self.players().len();
 
-            // Check if the player at the new turn index is still in the game and not in a hole
-            if self.players.borrow()[self.turn.get()].in_game.get()
-                && !self.players.borrow()[self.turn.get()].in_hole.get()
-            {
-                log::debug!("turn:{}", self.turn.get());
-                return Some(self.turn.get());
+        for _ in 0..num_players {
+            self.turn.set((self.turn.get() + 1) % num_players);
+
+            if let Some(player) = self.players.borrow()[self.turn.get()].as_ref() {
+                if !player.in_hole {
+                    return Some(self.turn.get());
+                }
             }
         }
 
@@ -187,43 +204,41 @@ impl MinigolfGame {
         let mut status_string = String::new();
 
         for player in self.players().iter() {
-            let status = if player.in_game.get() { 't' } else { 'f' };
+            let status = if player.is_some() { 't' } else { 'f' };
             status_string.push(status);
         }
 
         status_string
     }
 
-    pub fn players(&self) -> std::cell::Ref<'_, Vec<GamePlayer>> {
+    pub fn players(&self) -> std::cell::Ref<'_, Vec<Option<GamePlayer>>> {
         self.players.borrow()
+    }
+    pub fn players_mut(&self) -> RefMut<'_, Vec<Option<GamePlayer>>> {
+        self.players.borrow_mut()
     }
 
     pub fn playing_players(&self) -> usize {
-        self.players().iter().filter(|f| f.in_game.get()).count()
+        self.players().iter().filter(|f| f.is_some()).count()
     }
+
     pub fn want_skip(&self) -> bool {
-        let skips = self
-            .players()
-            .iter()
-            .filter(|f| f.in_game.get() && (f.want_skip.get() || f.in_hole.get()))
-            .count();
-        self.playing_players() == skips
+        self.players().iter().all(|f| {
+            f.as_ref()
+                .map_or(true, |player| player.want_skip || player.in_hole)
+        })
     }
+
     pub fn all_end_strokes(&self) -> bool {
-        let skips = self
-            .players()
+        self.players()
             .iter()
-            .filter(|f| f.in_game.get() && f.has_sent_end_stroke.get())
-            .count();
-        self.playing_players() == skips
+            .all(|f| f.as_ref().map_or(true, |player| player.has_sent_end_stroke))
     }
+
     pub fn all_in_hole(&self) -> bool {
-        let inhole = self
-            .players()
+        self.players()
             .iter()
-            .filter(|f| f.in_game.get() && f.in_hole.get())
-            .count();
-        self.playing_players() == inhole
+            .all(|f| f.as_ref().map_or(true, |player| player.in_hole))
     }
 
     pub fn max_players(&self) -> usize {
@@ -236,8 +251,10 @@ impl MinigolfGame {
 
     pub fn get_index(&self, client_id: ClientId) -> Option<usize> {
         for (i, c) in self.players().iter().enumerate() {
-            if c.id == client_id {
-                return Some(i);
+            if let Some(c) = c {
+                if c.id == client_id {
+                    return Some(i);
+                }
             }
         }
         None
@@ -253,6 +270,14 @@ impl MinigolfGame {
 
     pub fn turn(&self) -> usize {
         self.turn.get()
+    }
+
+    pub fn turn_start(&self) -> Instant {
+        self.turn_start.get()
+    }
+
+    pub fn set_turn_start(&self, turn_start: Instant) {
+        self.turn_start.set(turn_start);
     }
 }
 
@@ -309,7 +334,7 @@ impl GameServer {
             network_id: self.next_network_id(),
             turn: Cell::new(0),
             cur_track: Cell::new(0),
-            last_stroke: Instant::now(),
+            turn_start: Cell::new(Instant::now()),
             players: RefCell::new(Vec::new()),
         };
         let _ = game.add_player(client.id().unwrap());
@@ -338,7 +363,7 @@ impl GameServer {
             network_id: self.next_network_id(),
             turn: Cell::new(0),
             cur_track: Cell::new(0),
-            last_stroke: Instant::now(),
+            turn_start: Cell::new(Instant::now()),
             players: RefCell::new(Vec::new()),
         };
         self.add_game(game)
@@ -386,7 +411,7 @@ impl GameServer {
             players: RefCell::new(Vec::new()),
             network_id: self.next_network_id(),
             cur_track: Cell::new(0),
-            last_stroke: Instant::now(),
+            turn_start: Cell::new(Instant::now()),
         };
 
         let _ = game.add_player(client.id().unwrap());
@@ -416,28 +441,49 @@ impl GameServer {
                     })
                 }
             }
-            if 0 == room.playing_players() || 0 == room.players().len(){
+            if 0 == room.playing_players() || 0 == room.players().len() {
                 rooms_to_remove.insert(id);
                 continue; //dont fuck with removed rooms anymore
             }
             if room.all_end_strokes() {
                 //TODO handle scoring
                 if let Some(turn) = room.get_next_turn() {
-                    server.broadcast_game_with(Some(GameId(id)), |c| {
+                    server.broadcast_game_with(room, |c| {
                         c.send_packet(ServerToClient::GameStartTurn(GameStartTurn {
                             packet_number: c.next_num(),
                             index: turn,
                         }))
                     });
                 } else {
+                    for (i, c) in room.players_mut().iter_mut().enumerate() {
+                        if let Some(c) = c {
+                            c.strokes.push(c.cur_strokes.try_into().unwrap_or(i32::MAX));
+                            log::debug!("{} ended with {}", i, c.cur_strokes);
+                            c.cur_strokes = 0;
+                        }
+                    }
+
                     room.next_track(server);
                 }
-                for c in room.players().iter() {
-                    c.has_sent_end_stroke.set(false);
+                for c in room.players_mut().iter_mut() {
+                    if let Some(c) = c {
+                        c.has_sent_end_stroke = false;
+                    }
                 }
             }
             if room.want_skip() {
                 //TODO handle change scores
+                for (i, c) in room.players_mut().iter_mut().enumerate() {
+                    if let Some(c) = c {
+                        let stroke: i32 = if c.in_hole {
+                            c.cur_strokes.try_into().unwrap_or(i32::MAX)
+                        } else {
+                            -1
+                        };
+                        log::debug!("{} ends with {}", i, stroke);
+                        c.strokes.push(stroke);
+                    }
+                }
                 room.next_track(server);
             }
 
@@ -534,7 +580,7 @@ impl From<&client::LobbyChallenge> for MinigolfGame {
             network_id: 1337,
             players: RefCell::new(Vec::new()),
             cur_track: Cell::new(0),
-            last_stroke: Instant::now(),
+            turn_start: Cell::new(Instant::now()),
         }
     }
 }

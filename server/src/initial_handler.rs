@@ -6,7 +6,6 @@ use protocol::{
 };
 use rand::Rng;
 
-
 use crate::listener::Worker;
 
 pub enum InitialHandling {
@@ -94,7 +93,7 @@ pub async fn handle(worker: &mut Worker) -> anyhow::Result<InitialHandling> {
     */
     let username = match login.username.0 {
         Some(username) => username,
-        None => generate_username(),//TODO
+        None => generate_username(), //TODO
     };
 
     worker
